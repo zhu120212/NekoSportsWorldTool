@@ -1,13 +1,13 @@
-//! 跑步页：恒 sportType=1；距离/配速范围 + 开始时间（随机或指定，最多前 3 天）。
+//! 跑步页：恒 sportType=1；距离/配速范围 + 开始时间（随机或指定，日期自选）。
 //!
-//! 开始时间：「日期」下拉（今天 / 1-3 天前）两种模式共用；随机模式在该日 7:00-20:00
-//! 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
+//! 开始时间：「日期」用日历自选（近 `MAX_DAYS_BACK` 天到今天），两种模式共用；随机模式在该日
+//! 7:00-20:00 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
 //! （尚未到达时按当前时刻），「换一版」只重掷运动量，不动时刻。
 
 use super::map::MapState;
 use super::{mobile, theme, App};
 use crate::track::generate_road::RouteMode;
-use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
 use eframe::egui;
 
 /// 随机时刻窗口（含端点）：7:00-20:00。
@@ -15,18 +15,69 @@ const RAND_HOUR_LO: u32 = 7;
 const RAND_HOUR_HI: u32 = 20;
 /// flow.rs 提交时会给开始时间加 0-4s 抖动，随机模式抽样时预留，避免「开始 + 用时」越过当前时刻。
 const JITTER_MARGIN_MS: i64 = 5_000;
+/// 日期可回溯的最长天数：更早的日期会被钳制到窗口下界（服务端一般也只认近期数据）。
+const MAX_DAYS_BACK: i64 = 365;
 
-/// 指定日期（days_ago 天前）的 7:00-20:00 内均匀抽样一个时刻，且不晚于 latest_ms。
+/// 自选日期。
+///
+/// 包一层只为补一个默认值（今天）：chrono 的 `NaiveDate` 没有实现 `Default`，
+/// 而 `RunPage` 靠 `derive(Default)` 初始化。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunDate(pub NaiveDate);
+
+impl RunDate {
+    fn today() -> Self {
+        Self(Local::now().date_naive())
+    }
+
+    /// 收敛到可选窗口 `[今天-MAX_DAYS_BACK, 今天]`。
+    fn clamped(self) -> Self {
+        Self(clamp_date(self.0))
+    }
+}
+
+impl Default for RunDate {
+    fn default() -> Self {
+        Self::today()
+    }
+}
+
+/// 可选日期窗口的下界。
+fn earliest_date() -> NaiveDate {
+    Local::now().date_naive() - Duration::days(MAX_DAYS_BACK)
+}
+
+/// 既不允许未来，也不允许无限回溯。
+fn clamp_date(date: NaiveDate) -> NaiveDate {
+    date.clamp(earliest_date(), Local::now().date_naive())
+}
+
+/// 某年某月的天数。
+fn days_in_month(year: i32, month: u32) -> u32 {
+    (1..=31)
+        .rev()
+        .find(|d| NaiveDate::from_ymd_opt(year, month, *d).is_some())
+        .unwrap_or(31)
+}
+
+/// 由年/月/日合成日期；非法组合（例如 2 月 30 日）收敛到该月最后一天。
+fn date_from_parts(year: i32, month: i64, day: i64) -> NaiveDate {
+    let month = month.clamp(1, 12) as u32;
+    let day = day.clamp(1, days_in_month(year, month) as i64) as u32;
+    NaiveDate::from_ymd_opt(year, month, day).unwrap_or_else(|| Local::now().date_naive())
+}
+
+/// 指定日期的 7:00-20:00 内均匀抽样一个时刻，且不晚于 latest_ms。
 ///
 /// latest_ms = 当前时刻 - 用时 - 抖动余量。若该日窗口整体晚于 latest_ms（例如凌晨选「今天」），
 /// 退化为 latest_ms，宁可贴近当前时间，也不产生「未来开跑」。
-fn random_time_ago(days_ago: i64, latest_ms: i64) -> i64 {
-    let base = Local::now() - Duration::days(days_ago.clamp(0, 3));
+fn random_time_on(date: NaiveDate, latest_ms: i64) -> i64 {
+    let date = clamp_date(date);
     let lo = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), RAND_HOUR_LO, 0, 0)
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), RAND_HOUR_LO, 0, 0)
         .single();
     let hi = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), RAND_HOUR_HI, 0, 0)
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), RAND_HOUR_HI, 0, 0)
         .single();
     let (lo_ms, hi_ms) = match (lo, hi) {
         (Some(l), Some(h)) => (l.timestamp_millis(), h.timestamp_millis()),
@@ -38,26 +89,30 @@ fn random_time_ago(days_ago: i64, latest_ms: i64) -> i64 {
     lo_ms + (rand::random::<f64>() * span) as i64
 }
 
-/// 指定时刻：days_ago(0=今天) + 时/分；超出 3 天或在未来时做钳制。
-fn specified_time(days_ago: i64, hour: i64, minute: i64) -> i64 {
+/// 指定时刻：所选日期 + 时/分；早于窗口下界抬到下界，落在未来则钳制到当前时刻。
+fn specified_time(date: NaiveDate, hour: i64, minute: i64) -> i64 {
     let now = Local::now();
-    let base = now - Duration::days(days_ago.clamp(0, 3));
+    let date = clamp_date(date);
     let h = hour.clamp(0, 23);
     let m = minute.clamp(0, 59);
     let t = Local
-        .with_ymd_and_hms(base.year(), base.month(), base.day(), h as u32, m as u32, 0)
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), h as u32, m as u32, 0)
         .single()
         .map(|x| x.timestamp_millis())
         .unwrap_or_else(crate::crypto::envelope::now_ms);
     t.min(now.timestamp_millis())
 }
 
-/// 日期下拉的显示文本。
-fn days_ago_label(days_ago: i64) -> String {
-    match days_ago {
-        0 => "今天".into(),
-        1 => "昨天".into(),
-        n => format!("{n} 天前"),
+/// 星期几，仅用于界面上给个软确认。
+fn weekday_label(date: NaiveDate) -> &'static str {
+    match date.weekday() {
+        chrono::Weekday::Mon => "周一",
+        chrono::Weekday::Tue => "周二",
+        chrono::Weekday::Wed => "周三",
+        chrono::Weekday::Thu => "周四",
+        chrono::Weekday::Fri => "周五",
+        chrono::Weekday::Sat => "周六",
+        chrono::Weekday::Sun => "周日",
     }
 }
 
@@ -81,7 +136,8 @@ pub struct RunPage {
     pub manual_altitude: String,
     /// 0=随机时刻 1=指定时刻
     pub start_mode: usize,
-    pub days_ago: i64,
+    /// 日历自选的日期（默认今天，最早回溯 MAX_DAYS_BACK 天）
+    pub date: RunDate,
     pub hour: i64,
     pub minute: i64,
     pub face_check: bool,
@@ -117,7 +173,8 @@ pub struct RunPlan {
     pub pace_min: f32,
     pub pace_max: f32,
     pub start_mode: usize,
-    pub days_ago: i64,
+    /// 本次方案采用的日期
+    pub date: RunDate,
     pub hour: i64,
     pub minute: i64,
     /// 公里
@@ -144,7 +201,7 @@ impl RunPage {
     ///
     /// 随机模式的时刻是抽样结果（不是输入），只比对日期；指定模式的时/分是用户输入，需回比。
     fn time_matches(&self, p: &RunPlan) -> bool {
-        if p.start_mode != self.start_mode || p.days_ago != self.days_ago {
+        if p.start_mode != self.start_mode || p.date != self.date {
             return false;
         }
         self.start_mode == 0 || (p.hour == self.hour && p.minute == self.minute)
@@ -174,9 +231,9 @@ impl RunPage {
     /// 按当前模式与日期取一个开始时刻（随机模式抽样，指定模式采纳输入框）。
     fn pick_time(&self) -> i64 {
         if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
+            random_time_on(self.date.0, Self::latest_start_ms(self.dur_hint()))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.date.0, self.hour, self.minute)
         }
     }
 
@@ -208,7 +265,7 @@ impl RunPage {
         let start_ms = self.pick_time();
         if let Some(p) = self.plan.as_mut() {
             p.start_mode = self.start_mode;
-            p.days_ago = self.days_ago;
+            p.date = self.date;
             p.hour = self.hour;
             p.minute = self.minute;
             p.start_ms = start_ms;
@@ -223,7 +280,7 @@ impl RunPage {
             pace_min: self.pace_min,
             pace_max: self.pace_max,
             start_mode: self.start_mode,
-            days_ago: self.days_ago,
+            date: self.date,
             hour: self.hour,
             minute: self.minute,
             dist,
@@ -241,9 +298,9 @@ impl RunPage {
     pub fn regen_plan(&mut self) {
         let (dist, pace, dur) = self.sample_shape();
         let start_ms = if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(dur))
+            random_time_on(self.date.0, Self::latest_start_ms(dur))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.date.0, self.hour, self.minute)
         };
         self.write_plan(dist, pace, dur, start_ms);
     }
@@ -265,14 +322,14 @@ impl RunPage {
 
     /// 随机模式的抽样结果是否落在所选日期的 7:00-20:00 窗口内。
     ///
-    /// 凌晨选「今天」时窗口尚未到达，`random_time_ago` 会退化到贴近当前时刻，
+    /// 凌晨选「今天」时窗口尚未到达，`random_time_on` 会退化到贴近当前时刻，
     /// 此时界面需要说明，避免用户以为刻意选了凌晨。
     fn random_window_ok(&self) -> bool {
         let Some(p) = &self.plan else { return true };
         let Some(t) = Local.timestamp_millis_opt(p.start_ms).single() else {
             return true;
         };
-        let day = (Local::now() - Duration::days(self.days_ago.clamp(0, 3))).date_naive();
+        let day = clamp_date(self.date.0);
         t.date_naive() == day && (RAND_HOUR_LO..=RAND_HOUR_HI).contains(&t.hour())
     }
 }
@@ -366,15 +423,6 @@ impl App {
                 ui.label("开始时间：");
                 ui.radio_value(&mut page.start_mode, 0, "随机时刻");
                 ui.radio_value(&mut page.start_mode, 1, "指定时刻");
-                ui.label("日期：");
-                egui::ComboBox::from_id_salt("run_days_ago")
-                    .width(96.0)
-                    .selected_text(days_ago_label(page.days_ago))
-                    .show_ui(ui, |ui| {
-                        for d in 0..=3 {
-                            ui.selectable_value(&mut page.days_ago, d, days_ago_label(d));
-                        }
-                    });
                 if page.start_mode == 0 {
                     ui.label(format!("（{RAND_HOUR_LO}:00-{RAND_HOUR_HI}:00 内随机）"));
                 } else {
@@ -384,14 +432,45 @@ impl App {
                     mobile::drag_i64(ui, "run_minute", &mut page.minute, 0..=59, 1.0, "", "");
                 }
             });
-            if page.start_mode == 1 && page.days_ago == 0 {
+            // 日期自选：日历式年/月/日 + 近三天快捷按钮，窗口外的取值会被钳制到边界。
+            mobile::row(ui, |ui| {
+                ui.label("日期：");
+                if ui.small_button("今天").clicked() {
+                    page.date = RunDate::today();
+                }
+                if ui.small_button("昨天").clicked() {
+                    page.date = RunDate(Local::now().date_naive() - Duration::days(1)).clamped();
+                }
+                if ui.small_button("前天").clicked() {
+                    page.date = RunDate(Local::now().date_naive() - Duration::days(2)).clamped();
+                }
+                let cur = page.date.0;
+                let mut year = cur.year() as i64;
+                let mut month = cur.month() as i64;
+                let mut day = cur.day() as i64;
+                let max_day = days_in_month(cur.year(), cur.month()) as i64;
+                mobile::drag_i64(
+                    ui,
+                    "run_year",
+                    &mut year,
+                    earliest_date().year() as i64..=Local::now().year() as i64,
+                    1.0,
+                    "",
+                    " 年",
+                );
+                mobile::drag_i64(ui, "run_month", &mut month, 1..=12, 1.0, "", " 月");
+                mobile::drag_i64(ui, "run_day", &mut day, 1..=max_day, 1.0, "", " 日");
+                page.date = RunDate(date_from_parts(year as i32, month, day)).clamped();
+                ui.label(weekday_label(page.date.0));
+                ui.label(format!("（可选 {} ~ 今天）", earliest_date()));
+            });
+            if page.start_mode == 1 && page.date.0 == RunDate::today().0 {
                 // 今天 + 指定时刻：提示是否落在未来
-                let now = Local::now();
                 let spec = Local
                     .with_ymd_and_hms(
-                        now.year(),
-                        now.month(),
-                        now.day(),
+                        page.date.0.year(),
+                        page.date.0.month(),
+                        page.date.0.day(),
                         page.hour as u32,
                         page.minute as u32,
                         0,
@@ -506,7 +585,7 @@ impl App {
             return;
         }
         // 今天 + 指定时刻：提示是否落在未来（与原有行为一致）
-        if page.days_ago != 0 {
+        if page.date.0 != Local::now().date_naive() {
             return;
         }
         let now = Local::now();
@@ -1006,6 +1085,11 @@ impl App {
 mod tests {
     use super::*;
 
+    /// `days_ago` 天前的日期（测试用：把「N 天前」换成具体日历日）。
+    fn days_back(days_ago: i64) -> NaiveDate {
+        Local::now().date_naive() - Duration::days(days_ago)
+    }
+
     /// 一份参数合理的页面状态（配速 6:00/km，距离 2 km 附近）。
     fn page(start_mode: usize, days_ago: i64) -> RunPage {
         RunPage {
@@ -1015,7 +1099,7 @@ mod tests {
             pace_max: 370.0,
             manual_altitude: String::new(),
             start_mode,
-            days_ago,
+            date: RunDate(days_back(days_ago)),
             hour: 12,
             minute: 0,
             face_check: false,
@@ -1075,12 +1159,12 @@ mod tests {
 
     /// 日期由用户决定，「换一版」不应改动它。
     #[test]
-    fn shuffle_keeps_days_ago_in_specified_mode() {
+    fn shuffle_keeps_date_in_specified_mode() {
         let mut p = page(1, 2);
         for _ in 0..20 {
             p.regen_plan();
-            assert_eq!(p.days_ago, 2);
-            assert_eq!(p.plan.as_ref().unwrap().days_ago, 2);
+            assert_eq!(p.date.0, days_back(2));
+            assert_eq!(p.plan.as_ref().unwrap().date.0, days_back(2));
         }
     }
 
@@ -1108,7 +1192,7 @@ mod tests {
     #[test]
     fn never_schedules_future_start() {
         for mode in [0, 1] {
-            for days_ago in 0..=3 {
+            for days_ago in [0, 1, 3, 30, MAX_DAYS_BACK] {
                 let mut p = page(mode, days_ago);
                 for _ in 0..25 {
                     p.regen_plan();
@@ -1244,28 +1328,48 @@ mod tests {
         assert_random_not_future(&after);
     }
 
-    /// 日期下拉作用于两种模式。
+    /// 日历日期作用于两种模式。
     #[test]
     fn date_change_applies_to_both_modes() {
         for mode in [0, 1] {
             let mut p = page(mode, 0);
             p.regen_plan();
-            p.days_ago = 3;
+            p.date = RunDate(days_back(3));
             p.ensure_plan();
             let plan = p.plan.clone().unwrap();
-            assert_eq!(plan.days_ago, 3);
-            let want = (Local::now() - Duration::days(3)).date_naive();
+            assert_eq!(plan.date.0, days_back(3));
             let t = Local.timestamp_millis_opt(plan.start_ms).single().unwrap();
-            assert_eq!(t.date_naive(), want, "mode={mode} 未落到 3 天前");
+            assert_eq!(t.date_naive(), days_back(3), "mode={mode} 未落到 3 天前");
         }
     }
 
-    /// 日期下拉文本。
+    /// 自选日期：超出窗口的取值被钳制到边界（不许未来，也不许无限回溯）。
     #[test]
-    fn days_ago_labels() {
-        assert_eq!(days_ago_label(0), "今天");
-        assert_eq!(days_ago_label(1), "昨天");
-        assert_eq!(days_ago_label(3), "3 天前");
+    fn date_is_clamped_to_window() {
+        let today = Local::now().date_naive();
+        assert_eq!(clamp_date(today + Duration::days(1)), today, "未来日期未收敛");
+        assert_eq!(clamp_date(today), today);
+        assert_eq!(
+            clamp_date(today - Duration::days(MAX_DAYS_BACK + 30)),
+            earliest_date(),
+            "超出回溯上限的日期未收敛"
+        );
+        // 窗口内的日期原样保留
+        let inside = today - Duration::days(30);
+        assert_eq!(clamp_date(inside), inside);
+    }
+
+    /// 年/月/日组合非法时收敛到该月最后一天，不产生无效日期。
+    #[test]
+    fn date_from_parts_repairs_invalid_days() {
+        assert_eq!(date_from_parts(2025, 2, 30), date_from_parts(2025, 2, 28));
+        assert_eq!(date_from_parts(2024, 2, 99), date_from_parts(2024, 2, 29));
+        assert_eq!(date_from_parts(2025, 0, 5), date_from_parts(2025, 1, 5));
+        assert_eq!(date_from_parts(2025, 13, 5), date_from_parts(2025, 12, 5));
+        assert_eq!(date_from_parts(2025, 4, 0), date_from_parts(2025, 4, 1));
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2025, 2), 28);
+        assert_eq!(days_in_month(2025, 12), 31);
     }
 
     /// 同一帧内「距离 + 日期」一起改：两处变化都不能漏。
@@ -1275,14 +1379,13 @@ mod tests {
         p.regen_plan();
         p.dist_min = 4.0;
         p.dist_max = 4.5;
-        p.days_ago = 2;
+        p.date = RunDate(days_back(2));
         p.ensure_plan();
         let plan = p.plan.clone().unwrap();
-        assert_eq!(plan.days_ago, 2, "日期变化被漏掉");
+        assert_eq!(plan.date.0, days_back(2), "日期变化被漏掉");
         assert!(plan.dist >= 4.0, "距离变化被漏掉");
-        let want = (Local::now() - Duration::days(2)).date_naive();
         let t = Local.timestamp_millis_opt(plan.start_ms).single().unwrap();
-        assert_eq!(t.date_naive(), want);
+        assert_eq!(t.date_naive(), days_back(2));
         assert_random_not_future(&plan);
     }
 
@@ -1299,7 +1402,7 @@ mod tests {
         let plan = p.plan.clone().unwrap();
         assert_eq!((plan.hour, plan.minute), (8, 20), "时刻变化被漏掉");
         assert!(plan.dist >= 4.0, "距离变化被漏掉");
-        assert_eq!(plan.start_ms, specified_time(1, 8, 20));
+        assert_eq!(plan.start_ms, specified_time(days_back(1), 8, 20));
         assert_start_not_future(&plan);
     }
 
@@ -1329,7 +1432,7 @@ mod tests {
     /// 用「未来某天」构造，避免依赖当前钟点（23:xx 跑也不会失效）。
     #[test]
     fn future_specified_time_is_clamped_and_detectable() {
-        // days_ago 取负即未来，但会被 clamp 到 0；这里直接构造今天最后一刻
+        // 日历不允许选到明天之后；这里直接构造今天最后一刻
         let mut p = page(1, 0);
         p.hour = 23;
         p.minute = 59;
@@ -1386,9 +1489,9 @@ mod tests {
             .single()
             .unwrap()
             .timestamp_millis();
-        p.days_ago = 0;
+        p.date = RunDate::today();
         if let Some(plan) = p.plan.as_mut() {
-            plan.days_ago = 0;
+            plan.date = RunDate::today();
             plan.start_ms = early;
         }
         assert!(

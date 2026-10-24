@@ -430,7 +430,7 @@ impl App {
                     .or_else(|| config.manual_altitude.map(|v| v.to_string()))
                     .unwrap_or_default(),
                 start_mode: 0,
-                days_ago: 0,
+                date: Default::default(),
                 hour: 12,
                 minute: 0,
                 face_check: config.face_check,
